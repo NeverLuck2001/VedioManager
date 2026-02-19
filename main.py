@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -289,7 +290,9 @@ class MainWindow(QMainWindow):
         self.resize(1500, 900)
 
         self.current_dir = Path(DEFAULT_DIR)
-        self.video_items: list[VideoItem] = []
+        # all_video_items 保存完整扫描结果，filtered_video_items 保存过滤后的可见列表。
+        self.all_video_items: list[VideoItem] = []
+        self.filtered_video_items: list[VideoItem] = []
         self.current_index = -1
         self.current_score: int | None = None
         self.current_tags: list[str] = []
@@ -322,6 +325,12 @@ class MainWindow(QMainWindow):
         self.btn_choose_dir = QPushButton("选择文件夹")
         self.btn_choose_dir.clicked.connect(self.on_choose_dir)
         left_layout.addWidget(self.btn_choose_dir)
+
+        # 左侧过滤输入框：可按“文件名/评分/标签”关键字过滤当前目录视频。
+        self.edt_filter = QLineEdit()
+        self.edt_filter.setPlaceholderText("过滤：输入文件名、评分或标签关键字")
+        self.edt_filter.textChanged.connect(self.on_filter_changed)
+        left_layout.addWidget(self.edt_filter)
 
         self.list_widget = QListWidget()
         self.list_widget.currentRowChanged.connect(self.on_row_changed)
@@ -360,14 +369,20 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(score_layout)
 
         # 标签按钮
-        tag_layout = QHBoxLayout()
+        tag_layout = QVBoxLayout()
         tag_layout.addWidget(QLabel("标签："))
+        # 标签容器改为网格：根据宽度自适应换行，最多显示三行。
+        self.tag_container = QWidget()
+        self.tag_grid = QGridLayout(self.tag_container)
+        self.tag_grid.setContentsMargins(0, 0, 0, 0)
+        self.tag_grid.setHorizontalSpacing(8)
+        self.tag_grid.setVerticalSpacing(6)
         for tag in TAGS:
             btn = QPushButton(tag)
             btn.setCheckable(True)
             btn.clicked.connect(self._build_tag_handler(tag))
-            tag_layout.addWidget(btn)
             self.tag_buttons[tag] = btn
+        tag_layout.addWidget(self.tag_container)
         right_layout.addLayout(tag_layout)
 
         # 操作按钮
@@ -397,6 +412,52 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 3)
 
         self.setCentralWidget(container)
+        # 初始化完成后执行一次标签排版，确保首次显示即按宽度换行。
+        self.arrange_tag_buttons()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        """窗口尺寸变化时，实时调整标签按钮的自适应换行布局。"""
+
+        super().resizeEvent(event)
+        self.arrange_tag_buttons()
+
+    def arrange_tag_buttons(self) -> None:
+        """将标签按钮按可用宽度自动换行，最多三行。"""
+
+        if not hasattr(self, "tag_grid"):
+            return
+
+        # 清空旧布局项（按钮对象保留并复用）。
+        while self.tag_grid.count():
+            item = self.tag_grid.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
+        available = max(self.tag_container.width(), 360)
+        row = 0
+        col = 0
+        row_width = 0
+        spacing = self.tag_grid.horizontalSpacing() or 8
+
+        for tag in TAGS:
+            btn = self.tag_buttons[tag]
+            btn_w = btn.sizeHint().width()
+
+            # 当前行放不下则换行；最多三行，超出后继续塞到第三行。
+            if col > 0 and row_width + spacing + btn_w > available:
+                if row < 2:
+                    row += 1
+                    col = 0
+                    row_width = 0
+                else:
+                    col += 1
+                    self.tag_grid.addWidget(btn, row, col)
+                    continue
+
+            self.tag_grid.addWidget(btn, row, col)
+            row_width = btn_w if col == 0 else row_width + spacing + btn_w
+            col += 1
 
     def _bind_shortcuts(self) -> None:
         """绑定常用快捷键，提高人工筛选效率。"""
@@ -430,20 +491,90 @@ class MainWindow(QMainWindow):
             return
 
         self.current_dir = directory
-        self.video_items = []
+        self.all_video_items = []
         for item in directory.iterdir():
             if item.is_file() and item.suffix.lower() in VIDEO_EXTS:
                 stat = item.stat()
-                self.video_items.append(VideoItem(path=item, mtime=stat.st_mtime, size=stat.st_size))
+                self.all_video_items.append(VideoItem(path=item, mtime=stat.st_mtime, size=stat.st_size))
 
-        self.video_items.sort(key=lambda x: x.mtime, reverse=True)
-        self.refresh_list_widget()
+                # 重新扫描时：若文件名符合命名模板，则自动回填评分/标签到 state。
+                self.ingest_state_from_filename(item)
 
-        if self.video_items:
+        self.all_video_items.sort(key=lambda x: x.mtime, reverse=True)
+        self.apply_filter()
+
+        if self.filtered_video_items:
             self.list_widget.setCurrentRow(0)
         else:
             self.current_index = -1
             self.lbl_info.setText("未找到视频文件")
+            self.clear_screenshots()
+
+    def ingest_state_from_filename(self, path: Path) -> None:
+        """从文件名解析评分/标签并写入状态；不符合格式则跳过。"""
+
+        # 匹配：{score}-{tags}-{code}{ext}，其中 score/tags 可为空。
+        match = re.match(r"^(?P<score>\d*)-(?P<tags>.*)-(?P<code>[A-Z0-9]{6})$", path.stem)
+        if not match:
+            return
+
+        score_raw = match.group("score")
+        tags_raw = match.group("tags")
+        code = match.group("code")
+
+        # 分数仅接受 91~100；否则视为不合法格式，不导入。
+        score: int | None = None
+        if score_raw:
+            try:
+                parsed = int(score_raw)
+                if 91 <= parsed <= 100:
+                    score = parsed
+                else:
+                    return
+            except ValueError:
+                return
+
+        tags = [tag for tag in tags_raw.split("_") if tag] if tags_raw else []
+        self.state_manager.update(
+            path,
+            {
+                "score": score,
+                "tags": tags,
+                "code": code,
+                "renamed_to": str(path),
+            },
+        )
+
+    def on_filter_changed(self, _text: str) -> None:
+        """过滤输入变化时，实时刷新左侧可见视频列表。"""
+
+        self.apply_filter()
+
+    def apply_filter(self) -> None:
+        """按关键字过滤视频：匹配文件名、评分文本、标签文本。"""
+
+        keyword = self.edt_filter.text().strip().lower() if hasattr(self, "edt_filter") else ""
+        if not keyword:
+            self.filtered_video_items = list(self.all_video_items)
+        else:
+            filtered: list[VideoItem] = []
+            for video in self.all_video_items:
+                state = self.state_manager.get(video.path)
+                score = state.get("score")
+                tags = state.get("tags", [])
+                haystack = " ".join(
+                    [video.path.name.lower(), str(score or "").lower(), "_".join(tags).lower()]
+                )
+                if keyword in haystack:
+                    filtered.append(video)
+            self.filtered_video_items = filtered
+
+        self.refresh_list_widget()
+        if self.filtered_video_items:
+            self.list_widget.setCurrentRow(0)
+        else:
+            self.current_index = -1
+            self.lbl_info.setText("过滤后无匹配视频")
             self.clear_screenshots()
 
     def refresh_list_widget(self) -> None:
@@ -451,7 +582,7 @@ class MainWindow(QMainWindow):
 
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
-        for video in self.video_items:
+        for video in self.filtered_video_items:
             state = self.state_manager.get(video.path)
             score = state.get("score")
             tags = state.get("tags", [])
@@ -474,12 +605,12 @@ class MainWindow(QMainWindow):
     def on_row_changed(self, row: int) -> None:
         """当用户切换列表选中项时，加载对应状态与截图。"""
 
-        if row < 0 or row >= len(self.video_items):
+        if row < 0 or row >= len(self.filtered_video_items):
             return
 
         self.save_current_state()
         self.current_index = row
-        current = self.video_items[row]
+        current = self.filtered_video_items[row]
         self.load_state_for_video(current.path)
         self.update_video_info(current)
         self.load_screenshots_async(current.path)
@@ -496,9 +627,9 @@ class MainWindow(QMainWindow):
     def save_current_state(self) -> None:
         """切换视频前保存当前评分/标签，防止操作丢失。"""
 
-        if self.current_index < 0 or self.current_index >= len(self.video_items):
+        if self.current_index < 0 or self.current_index >= len(self.filtered_video_items):
             return
-        path = self.video_items[self.current_index].path
+        path = self.filtered_video_items[self.current_index].path
         old = self.state_manager.get(path)
         payload = {
             "score": self.current_score,
@@ -566,9 +697,9 @@ class MainWindow(QMainWindow):
     def refresh_current_info_only(self) -> None:
         """局部刷新当前视频信息，不触发截图重载。"""
 
-        if self.current_index < 0 or self.current_index >= len(self.video_items):
+        if self.current_index < 0 or self.current_index >= len(self.filtered_video_items):
             return
-        self.update_video_info(self.video_items[self.current_index])
+        self.update_video_info(self.filtered_video_items[self.current_index])
 
     def load_screenshots_async(self, path: Path) -> None:
         """启动后台任务生成截图，并展示加载状态。"""
@@ -586,7 +717,7 @@ class MainWindow(QMainWindow):
         """后台截图完成后回填到网格区域。"""
 
         # 如果用户已切换到其他视频，则忽略过期任务结果。
-        if self.current_index < 0 or self.video_items[self.current_index].path != Path(video_path):
+        if self.current_index < 0 or self.filtered_video_items[self.current_index].path != Path(video_path):
             return
 
         self.clear_screenshots()
@@ -657,11 +788,12 @@ class MainWindow(QMainWindow):
             self.state_manager.remove(current.path)
             self.clean_cache_for_video(current.path)
             removed_index = self.current_index
-            self.video_items.pop(removed_index)
-            self.refresh_list_widget()
+            # 从全量列表移除当前文件，再按过滤条件重建可见列表。
+            self.all_video_items = [v for v in self.all_video_items if v.path != current.path]
+            self.apply_filter()
 
-            if self.video_items:
-                next_index = min(removed_index, len(self.video_items) - 1)
+            if self.filtered_video_items:
+                next_index = min(removed_index, len(self.filtered_video_items) - 1)
                 self.list_widget.setCurrentRow(next_index)
             else:
                 self.current_index = -1
@@ -687,33 +819,41 @@ class MainWindow(QMainWindow):
     def on_confirm(self) -> None:
         """确认：先重命名当前视频，再自动跳到下一个。"""
 
-        if self.rename_current_video_if_needed():
-            self.goto_next_video()
+        # 新规则：确认按钮始终进入下一个；仅当“评分+标签”都已填写时才重命名。
+        self.rename_current_video_if_needed(require_complete_fields=True)
+        self.goto_next_video()
 
     def on_next(self) -> None:
         """下一个：按需求先尝试重命名，再切换到下一个。"""
 
-        if self.rename_current_video_if_needed():
-            self.goto_next_video()
+        # 新规则：下一个按钮始终切换；仅当“评分+标签”都已填写时才重命名。
+        self.rename_current_video_if_needed(require_complete_fields=True)
+        self.goto_next_video()
 
     def on_prev(self) -> None:
-        """上一个：仅切换，不触发自动重命名。"""
+        """上一个：切换到上一个；当评分+标签完整时先执行重命名。"""
 
-        if not self.video_items:
+        if not self.filtered_video_items:
             return
+        # 新规则：上一个按钮在“评分+标签”都已填写时，同样执行重命名。
+        self.rename_current_video_if_needed(require_complete_fields=True)
         target = max(self.current_index - 1, 0)
         self.list_widget.setCurrentRow(target)
 
     def goto_next_video(self) -> None:
         """切换到列表中的下一个视频。"""
 
-        if not self.video_items:
+        if not self.filtered_video_items:
             return
-        target = min(self.current_index + 1, len(self.video_items) - 1)
+        target = min(self.current_index + 1, len(self.filtered_video_items) - 1)
         self.list_widget.setCurrentRow(target)
 
-    def rename_current_video_if_needed(self) -> bool:
-        """执行强约束重命名：{score}-{tags}-{code}{ext}。"""
+    def rename_current_video_if_needed(self, require_complete_fields: bool = False) -> bool:
+        """执行强约束重命名：{score}-{tags}-{code}{ext}。
+
+        Args:
+            require_complete_fields: 为 True 时，要求评分和标签都已填写才执行重命名。
+        """
 
         current = self.get_current_video()
         if current is None:
@@ -721,6 +861,11 @@ class MainWindow(QMainWindow):
 
         old_path = current.path
         old_state = self.state_manager.get(old_path)
+
+        # 新规则开关：若要求“字段完整”但评分或标签缺失，则直接跳过重命名。
+        if require_complete_fields and (self.current_score is None or not self.current_tags):
+            self.status_message("评分或标签未完整填写，已跳过重命名")
+            return False
 
         score_text = str(self.current_score) if self.current_score is not None else ""
         tags_text = "_".join(sanitize_for_windows(tag) for tag in self.current_tags) if self.current_tags else ""
@@ -760,7 +905,11 @@ class MainWindow(QMainWindow):
 
         try:
             old_path.rename(new_path)
-            self.video_items[self.current_index].path = new_path
+            # 同步更新全量列表与过滤列表中的路径引用，保持 UI/状态一致。
+            for collection in (self.all_video_items, self.filtered_video_items):
+                for item in collection:
+                    if item.path == old_path:
+                        item.path = new_path
             self.state_manager.move_key(old_path, new_path)
             self.state_manager.update(
                 new_path,
@@ -782,9 +931,9 @@ class MainWindow(QMainWindow):
     def get_current_video(self) -> VideoItem | None:
         """返回当前选中的视频对象，无选中时返回 None。"""
 
-        if self.current_index < 0 or self.current_index >= len(self.video_items):
+        if self.current_index < 0 or self.current_index >= len(self.filtered_video_items):
             return None
-        return self.video_items[self.current_index]
+        return self.filtered_video_items[self.current_index]
 
     def status_message(self, text: str) -> None:
         """更新状态栏文本（非阻塞提示）。"""
